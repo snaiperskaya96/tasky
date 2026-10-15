@@ -1,7 +1,7 @@
 //! The sampling thread.
 //!
-//! One background thread owns the whole sysinfo state machine, so the UI never
-//! blocks on it. It publishes an immutable `Arc<Snapshot>` into a shared slot
+//! One background thread owns all sampling state, so the UI never blocks on
+//! it. It publishes an immutable `Arc<Snapshot>` into a shared slot
 //! and pokes the UI to repaint; the UI only swaps in a new Arc pointer when one
 //! appears, which keeps filtering and sorting off the frame path.
 //!
@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-use crate::sys::{gpu::GpuSampler, priority, procs::thread_counts};
+use crate::sys::gpu::GpuSampler;
+use crate::sys::machine::{self, CpuTimes, PerCore};
+use crate::sys::priority;
+use crate::sys::procs::{self, ProcessTable};
 
 /// How often the sampler wakes up.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
@@ -35,18 +36,8 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
-    fn new(pid: u32, process: &Process) -> Self {
-        let name = process.name().to_string_lossy().into_owned();
-        let executable = process
-            .exe()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-        let command_line = process
-            .cmd()
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
+    fn new(pid: u32, name: String) -> Self {
+        let (executable, command_line) = procs::image_details(pid);
         let search_key = format!("{name}\n{executable}\n{command_line}\n{pid}").to_lowercase();
         Self {
             name,
@@ -75,7 +66,6 @@ pub struct Row {
     /// Lifetime byte totals, for the tooltip.
     pub total_read: u64,
     pub total_written: u64,
-    /// Only filled in while the Threads column is visible.
     pub threads: u32,
     pub suspended: bool,
 }
@@ -117,55 +107,82 @@ pub struct Snapshot {
     pub totals: Totals,
     /// Monotonic id, so the UI can tell "new data" from "same data".
     pub sequence: u64,
-    /// Whether per-process GPU counters were available.
-    pub gpu_available: bool,
+    /// `None` while GPU usage is not being collected, otherwise whether the
+    /// per-process GPU counters could be read.
+    pub gpu_available: Option<bool>,
 }
 
 /// Knobs the UI turns while the sampler runs.
 struct Controls {
     interval_ms: AtomicU64,
+    /// The main window is visible.
     active: AtomicBool,
-    want_threads: AtomicBool,
+    /// The emergency window is open.
+    emergency: AtomicBool,
+    want_gpu: AtomicBool,
 }
 
-/// Owns the background sampling thread.
+impl Controls {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed) || self.emergency.load(Ordering::Relaxed)
+    }
+}
+
+type Callback = Box<dyn Fn() + Send>;
+
+/// Handle to the background sampling thread. Clones share the same thread.
+#[derive(Clone)]
 pub struct Sampler {
     snapshot: Arc<Mutex<Option<Arc<Snapshot>>>>,
     controls: Arc<Controls>,
+    on_update: Arc<Mutex<Option<Callback>>>,
     thread: Thread,
 }
 
 impl Sampler {
     /// `suspended` is shared with the UI so both can agree on which processes we
-    /// have frozen. `on_update` runs on the sampler thread after each snapshot.
-    pub fn spawn(
-        suspended: Arc<Mutex<HashSet<u32>>>,
-        on_update: impl Fn() + Send + 'static,
-    ) -> Self {
+    /// have frozen.
+    pub fn spawn(suspended: Arc<Mutex<HashSet<u32>>>) -> Self {
         let snapshot = Arc::new(Mutex::new(None));
         let controls = Arc::new(Controls {
             interval_ms: AtomicU64::new(SAMPLE_INTERVAL.as_millis() as u64),
             active: AtomicBool::new(true),
-            want_threads: AtomicBool::new(false),
+            emergency: AtomicBool::new(false),
+            want_gpu: AtomicBool::new(true),
         });
+
+        let on_update: Arc<Mutex<Option<Callback>>> = Arc::new(Mutex::new(None));
 
         let slot = Arc::clone(&snapshot);
         let shared = Arc::clone(&controls);
+        let callback = Arc::clone(&on_update);
         let handle = thread::Builder::new()
             .name("tasky-sampler".into())
-            .spawn(move || collect(&slot, &suspended, &shared, on_update))
+            .spawn(move || {
+                collect(&slot, &suspended, &shared, || {
+                    if let Some(callback) = lock(&callback).as_ref() {
+                        callback();
+                    }
+                })
+            })
             .expect("could not start the sampler thread");
 
         Self {
             snapshot,
             controls,
+            on_update,
             thread: handle.thread().clone(),
         }
     }
 
+    /// Run `callback` on the sampler thread after each new snapshot.
+    pub fn set_on_update(&self, callback: impl Fn() + Send + 'static) {
+        *lock(&self.on_update) = Some(Box::new(callback));
+    }
+
     /// The newest snapshot, once one has landed.
     pub fn latest(&self) -> Option<Arc<Snapshot>> {
-        self.snapshot.lock().unwrap().clone()
+        lock(&self.snapshot).clone()
     }
 
     pub fn set_interval(&self, interval: Duration) {
@@ -175,39 +192,55 @@ impl Sampler {
         self.thread.unpark();
     }
 
-    /// Pause sampling while nobody can see the result.
+    /// Pause sampling while nobody can see the main window.
     pub fn set_active(&self, active: bool) {
-        let was_active = self.controls.active.swap(active, Ordering::Relaxed);
-        if active && !was_active {
-            self.thread.unpark();
+        Self::set_flag(&self.controls.active, active, &self.thread);
+    }
+
+    /// Keep sampling for the emergency window, whatever the main window does.
+    pub fn set_emergency(&self, open: bool) {
+        Self::set_flag(&self.controls.emergency, open, &self.thread);
+    }
+
+    fn set_flag(flag: &AtomicBool, on: bool, thread: &Thread) {
+        if flag.swap(on, Ordering::Relaxed) != on {
+            thread.unpark();
         }
     }
 
-    /// Thread counts need their own system-wide snapshot, so only take one
-    /// while the column is on screen.
-    pub fn set_collect_threads(&self, on: bool) {
-        self.controls.want_threads.store(on, Ordering::Relaxed);
+    /// The GPU performance counters are by far the most expensive thing to
+    /// read, so only read them while GPU usage is on screen.
+    pub fn set_collect_gpu(&self, on: bool) {
+        self.controls.want_gpu.store(on, Ordering::Relaxed);
     }
 }
 
-/// What we ask sysinfo for on every pass. Notably not `everything()`, which
-/// also reads each process's environment block, working directory and owner
-/// token. Path and command line are read once per process.
-fn refresh_kind() -> ProcessRefreshKind {
-    ProcessRefreshKind::nothing()
-        .with_cpu()
-        .with_memory()
-        .with_disk_usage()
-        .with_exe(UpdateKind::OnlyIfNotSet)
-        .with_cmd(UpdateKind::OnlyIfNotSet)
+/// Lock a mutex even if a panicking thread poisoned it; the data here is
+/// always left consistent.
+pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Per-process state the sampler carries from one pass to the next.
+/// What we remember about a live process between samples.
+struct Tracked {
+    info: Arc<ProcessInfo>,
+    cpu_time: u64,
+    read: u64,
+    written: u64,
+}
+
+/// State the sampler carries from one pass to the next.
 struct State {
-    sys: System,
-    gpu: GpuSampler,
-    /// Keyed by PID and start time, so a recycled PID gets fresh info.
-    info: HashMap<(u32, u64), Arc<ProcessInfo>>,
+    table: ProcessTable,
+    per_core: PerCore,
+    /// Present only while GPU usage is wanted.
+    gpu: Option<GpuSampler>,
+    /// Keyed by PID and creation time, so a recycled PID starts afresh.
+    tracked: HashMap<(u32, i64), Tracked>,
+    cpu: CpuTimes,
+    cores: Vec<CpuTimes>,
     sequence: u64,
 }
 
@@ -220,33 +253,32 @@ fn collect(
     priority::lower_current_thread();
 
     let mut state = State {
-        sys: System::new(),
-        gpu: GpuSampler::new(),
-        info: HashMap::new(),
+        table: ProcessTable::new(),
+        per_core: PerCore::new(),
+        gpu: None,
+        tracked: HashMap::new(),
+        cpu: CpuTimes::default(),
+        cores: Vec::new(),
         sequence: 0,
     };
-    // Total RAM and the CPU list only change when the machine is
-    // reconfigured, but sysinfo needs the CPU list to scale process usage.
-    state.sys.refresh_memory();
-    state.sys.refresh_cpu_all();
 
-    let mut last_sample = prime(&mut state);
+    let mut last_sample = prime(&mut state, suspended, controls);
     let mut was_active = true;
     // Right after a baseline, sample as soon as rates mean something, so the
     // window fills in quickly at startup and when it is brought back.
     let mut primed = true;
 
     loop {
-        if !controls.active.load(Ordering::Relaxed) {
+        if !controls.is_active() {
             was_active = false;
             thread::park();
             continue;
         }
         if !was_active {
-            // CPU, disk and GPU are rates; without a fresh baseline the first
+            // CPU, I/O and GPU are rates; without a fresh baseline the first
             // sample after a long pause would average over the whole pause.
             was_active = true;
-            last_sample = prime(&mut state);
+            last_sample = prime(&mut state, suspended, controls);
             primed = true;
         }
 
@@ -268,107 +300,134 @@ fn collect(
         last_sample = now;
         primed = false;
 
-        let want_threads = controls.want_threads.load(Ordering::Relaxed);
-        let snapshot = build_snapshot(&mut state, suspended, elapsed, want_threads);
-        *slot.lock().unwrap() = Some(snapshot);
+        let snapshot = build_snapshot(&mut state, suspended, controls, elapsed);
+        *lock(slot) = Some(snapshot);
         on_update();
     }
 }
 
 /// Take a baseline reading for every rate-based counter.
-fn prime(state: &mut State) -> Instant {
-    state
-        .sys
-        .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
-    state.sys.refresh_cpu_usage();
-    state.gpu.sample();
+fn prime(state: &mut State, suspended: &Mutex<HashSet<u32>>, controls: &Controls) -> Instant {
+    build_snapshot(state, suspended, controls, 1.0);
     Instant::now()
 }
 
 fn build_snapshot(
     state: &mut State,
     suspended: &Mutex<HashSet<u32>>,
+    controls: &Controls,
     elapsed: f64,
-    want_threads: bool,
 ) -> Arc<Snapshot> {
-    let sys = &mut state.sys;
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
-    sys.refresh_memory();
-    sys.refresh_cpu_usage();
+    state.table.refresh();
+    let cpu = machine::cpu_times();
+    let cores = state.per_core.sample();
+    let (memory_used, memory_total) = machine::memory();
 
-    let gpu_by_pid = state.gpu.sample();
-    let threads_by_pid = if want_threads {
-        thread_counts()
-    } else {
-        HashMap::new()
+    // Opening the GPU query takes its own baseline, so a freshly enabled
+    // sampler reports nothing until the next pass.
+    let want_gpu = controls.want_gpu.load(Ordering::Relaxed);
+    let gpu_by_pid = match (&mut state.gpu, want_gpu) {
+        (Some(gpu), true) => gpu.sample(),
+        (None, true) => {
+            state.gpu = Some(GpuSampler::new());
+            HashMap::new()
+        }
+        (_, false) => {
+            state.gpu = None;
+            HashMap::new()
+        }
     };
 
-    // sysinfo reports per-process CPU on a per-core scale (100% per core).
-    let cpu_count = sys.cpus().len().max(1) as f64;
+    // Process CPU time over the machine's total CPU time (all processors,
+    // idle included) gives Task Manager's normalized percentage directly.
+    let cpu_elapsed = cpu.total.saturating_sub(state.cpu.total).max(1) as f64;
 
-    // Forget processes we suspended that have since exited, so a recycled
-    // PID is not shown as suspended (or resumed on exit).
-    let mut suspended_pids = suspended.lock().unwrap();
-    suspended_pids.retain(|pid| sys.process(Pid::from_u32(*pid)).is_some());
-
-    let mut info = HashMap::with_capacity(sys.processes().len());
-    let mut rows = Vec::with_capacity(sys.processes().len());
+    let mut suspended_pids = lock(suspended);
+    let mut tracked = HashMap::with_capacity(state.tracked.len() + 16);
+    let mut rows = Vec::with_capacity(state.tracked.len() + 16);
     let mut totals = Totals {
-        memory_total: sys.total_memory(),
+        memory_used,
+        memory_total,
         ..Totals::default()
     };
 
-    for (pid, process) in sys.processes() {
-        let pid = pid.as_u32();
+    for entry in state.table.iter() {
+        let pid = entry.pid();
+        // PID 0 is the idle "process"; it would only ever top the CPU column.
+        if pid == 0 {
+            continue;
+        }
+        let key = (pid, entry.create_time());
+        let cpu_time = entry.cpu_time();
+        let (read, written) = entry.io_bytes();
 
-        let key = (pid, process.start_time());
-        let cached = state.info.remove(&key).filter(|known| {
-            // Path and command line can fail to read on first sight and
-            // succeed later; pick them up when they do.
-            !(known.executable.is_empty() && process.exe().is_some()
-                || known.command_line.is_empty() && !process.cmd().is_empty())
-        });
-        let process_info = cached.unwrap_or_else(|| Arc::new(ProcessInfo::new(pid, process)));
-        info.insert(key, Arc::clone(&process_info));
+        // A process we have not seen before started after the previous pass,
+        // so everything it has done so far happened within this interval.
+        let previous = state.tracked.remove(&key);
+        let (info, before) = match previous {
+            Some(known) => (known.info, (known.cpu_time, known.read, known.written)),
+            None => (Arc::new(ProcessInfo::new(pid, entry.name())), (0, 0, 0)),
+        };
 
-        // sysinfo keeps the bytes moved since the previous refresh; for a
-        // process first seen this pass that is everything since it started.
-        let usage = process.disk_usage();
         let row = Row {
             pid,
-            ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
-            info: process_info,
-            cpu: process.cpu_usage() as f64 / cpu_count,
-            memory: process.virtual_memory(),
+            ppid: entry.ppid(),
+            info: Arc::clone(&info),
+            cpu: (cpu_time.saturating_sub(before.0) as f64 / cpu_elapsed * 100.0).min(100.0),
+            memory: entry.private_bytes(),
             gpu: gpu_by_pid.get(&pid).copied().unwrap_or(0.0),
-            read_bps: usage.read_bytes as f64 / elapsed,
-            write_bps: usage.written_bytes as f64 / elapsed,
-            total_read: usage.total_read_bytes,
-            total_written: usage.total_written_bytes,
-            threads: threads_by_pid.get(&pid).copied().unwrap_or(0),
+            read_bps: read.saturating_sub(before.1) as f64 / elapsed,
+            write_bps: written.saturating_sub(before.2) as f64 / elapsed,
+            total_read: read,
+            total_written: written,
+            threads: entry.threads(),
             suspended: suspended_pids.contains(&pid),
         };
+        tracked.insert(
+            key,
+            Tracked {
+                info,
+                cpu_time,
+                read,
+                written,
+            },
+        );
 
         totals.gpu += row.gpu;
         totals.read_bps += row.read_bps;
         totals.write_bps += row.write_bps;
         rows.push(row);
     }
+
+    // Forget processes we suspended that have since exited, so a recycled
+    // PID is not shown as suspended (or resumed on exit).
+    suspended_pids.retain(|pid| rows.iter().any(|row| row.pid == *pid));
     drop(suspended_pids);
-    // Whatever is left belongs to processes that have exited.
-    state.info = info;
 
     totals.processes = rows.len();
-    totals.memory_used = sys.used_memory();
-    totals.per_core_cpu = sys.cpus().iter().map(|c| c.cpu_usage() as f64).collect();
-    totals.cpu = sys.global_cpu_usage() as f64;
+    totals.cpu = cpu.percent_since(state.cpu);
+    totals.per_core_cpu = cores
+        .iter()
+        .zip(
+            state
+                .cores
+                .iter()
+                .chain(std::iter::repeat(&CpuTimes::default())),
+        )
+        .map(|(now, before)| now.percent_since(*before))
+        .collect();
     totals.gpu = totals.gpu.min(100.0);
 
+    // Whatever was not carried over belongs to processes that have exited.
+    state.tracked = tracked;
+    state.cpu = cpu;
+    state.cores = cores;
     state.sequence += 1;
+
     Arc::new(Snapshot {
         rows,
         totals,
         sequence: state.sequence,
-        gpu_available: state.gpu.is_available(),
+        gpu_available: state.gpu.as_ref().map(GpuSampler::is_available),
     })
 }

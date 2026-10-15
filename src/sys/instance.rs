@@ -1,35 +1,45 @@
 //! Single instance, plus raising the main window from any thread.
 //!
-//! The first instance holds a named mutex for its whole lifetime and owns a
-//! hidden window of a known class. A second launch finds that window and posts
-//! it a message. The window procedure raises the main window directly, so this
-//! works even while eframe's loop is idle behind a hidden window.
+//! The first instance holds a named mutex for its whole lifetime. A dedicated
+//! host thread owns a hidden window of a known class and the global hotkey,
+//! and runs its own message loop. A second launch finds that window and posts
+//! it a message. Because none of this runs on the UI thread, Tasky can still be
+//! summoned when the UI is idle behind a hidden window, and when the UI thread
+//! has stopped responding (then the emergency window opens instead).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
-    WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_ACCESSDENIED, HANDLE, HINSTANCE, HWND,
+    LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
-    FindWindowW, IsIconic, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, ASFW_ANY, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WNDCLASSW, WS_OVERLAPPED,
+    DispatchMessageW, FindWindowW, GetMessageW, IsIconic, PostMessageW, RegisterClassW,
+    SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, ASFW_ANY,
+    HWND_NOTOPMOST, HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_HOTKEY, WM_NULL,
+    WNDCLASSW, WS_OVERLAPPED,
 };
+
+use crate::sys::hotkey;
 
 const HOST_CLASS: PCWSTR = w!("TaskyHostWindow");
 const MUTEX_NAME: PCWSTR = w!("Local\\TaskySingleInstance");
 const WM_TASKY_ACTIVATE: u32 = WM_APP + 1;
+/// How long the main window gets to answer before it counts as hung.
+const RESPONSE_TIMEOUT_MS: u32 = 1000;
 
 static MAIN_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(false);
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ON_SHOW: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static HOTKEY: OnceLock<Option<&'static str>> = OnceLock::new();
 
 /// Proof that this is the only running instance. Keep it alive for as long as
 /// the app runs: dropping it releases the mutex.
@@ -47,8 +57,8 @@ impl Drop for Instance {
     }
 }
 
-/// Acquire the instance mutex and create the hidden host window, or return
-/// `None` if another instance already holds the mutex.
+/// Acquire the instance mutex and start the host thread, or return `None` if
+/// another instance already holds the mutex.
 pub fn claim() -> Option<Instance> {
     let mutex = match unsafe { CreateMutexW(None, false, MUTEX_NAME) } {
         Ok(handle) => {
@@ -60,10 +70,27 @@ pub fn claim() -> Option<Instance> {
             }
             Some(handle)
         }
+        // An elevated instance's mutex cannot be opened from an unelevated
+        // launch, which is just as much proof that one is running.
+        Err(error) if error.code() == E_ACCESSDENIED => return None,
         // Better a second copy than none at all.
         Err(_) => None,
     };
 
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let started = std::thread::Builder::new()
+        .name("tasky-host".into())
+        .spawn(move || host_thread(ready_tx))
+        .is_ok();
+    if started {
+        // Wait until the window can be found and the hotkey is settled.
+        let _ = ready_rx.recv();
+    }
+
+    Some(Instance { mutex })
+}
+
+fn host_thread(ready: mpsc::Sender<()>) {
     let hinstance = unsafe { GetModuleHandleW(None) }
         .map(|module| HINSTANCE(module.0))
         .unwrap_or_default();
@@ -94,8 +121,43 @@ pub fn claim() -> Option<Instance> {
             let _ = ChangeWindowMessageFilterEx(host, WM_TASKY_ACTIVATE, MSGFLT_ALLOW, None);
         }
     }
+    let _ = HOTKEY.set(hotkey::register());
+    let _ = ready.send(());
 
-    Some(Instance { mutex })
+    let mut msg = MSG::default();
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        // The hotkey arrives as a thread message, with no window attached.
+        if msg.message == WM_HOTKEY {
+            summon();
+            continue;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// The label of the registered hotkey, if one could be registered.
+pub fn hotkey_label() -> Option<&'static str> {
+    HOTKEY.get().copied().flatten()
+}
+
+/// Whether another Tasky is running in this session.
+pub fn is_running() -> bool {
+    unsafe { FindWindowW(HOST_CLASS, PCWSTR::null()) }.is_ok()
+}
+
+/// Wait up to `timeout` for a starting instance to come up.
+pub fn wait_until_running(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if is_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 /// Ask the already running instance to show itself.
@@ -129,7 +191,35 @@ fn main_window() -> Option<HWND> {
     }
 }
 
-/// Show, restore and focus the main window. Safe to call from any thread.
+/// Whether the window's thread answers a no-op message in time.
+fn is_responsive(hwnd: HWND) -> bool {
+    let mut result = 0usize;
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            RESPONSE_TIMEOUT_MS,
+            Some(&mut result),
+        )
+    }
+    .0 != 0
+}
+
+/// What the hotkey and a second launch do: raise the main window, or open the
+/// emergency window when there is no main window or it is not responding
+/// (a hung graphics driver, say).
+pub fn summon() {
+    match main_window() {
+        Some(hwnd) if is_responsive(hwnd) => show_main_window(),
+        _ => crate::emergency::open(),
+    }
+}
+
+/// Show, restore and focus the main window. Called from the host thread after
+/// checking the window responds, and from the UI thread itself (tray).
 pub fn show_main_window() {
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(hwnd) = main_window() {
@@ -185,7 +275,7 @@ unsafe extern "system" fn host_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_TASKY_ACTIVATE {
-        show_main_window();
+        summon();
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

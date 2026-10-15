@@ -7,28 +7,75 @@
 
 mod app;
 mod collector;
+mod emergency;
 mod fmt;
 mod sys;
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use eframe::egui;
-use sys::icon;
+use sys::{control, elevation, icon, instance};
 
 const APP_NAME: &str = "Tasky";
 
-fn main() -> eframe::Result<()> {
-    if std::env::args().any(|argument| argument == "--probe") {
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|argument| argument == flag);
+
+    if has("--probe") {
         probe();
-        return Ok(());
+        return;
+    }
+    if has("--install-task") {
+        std::process::exit(task_command(elevation::install_task, "--install-task"));
+    }
+    if has("--uninstall-task") {
+        std::process::exit(task_command(elevation::uninstall_task, "--uninstall-task"));
     }
 
-    // A second launch activates the running instance and exits.
-    let Some(_instance) = sys::instance::claim() else {
-        sys::instance::activate_existing();
-        return Ok(());
+    // "Restart as administrator" starts us before the old instance is gone.
+    if let Some(pid) = args
+        .iter()
+        .position(|argument| argument == "--wait-for")
+        .and_then(|at| args.get(at + 1))
+        .and_then(|pid| pid.parse().ok())
+    {
+        elevation::wait_for_exit(pid, Duration::from_secs(15));
+    }
+
+    // A second launch brings the running instance forward and exits.
+    if instance::is_running() {
+        instance::activate_existing();
+        return;
+    }
+
+    if !elevation::is_elevated() {
+        // Prefer the elevated logon task to running with a limited token: it
+        // needs no UAC prompt.
+        if elevation::task_installed()
+            && elevation::run_task()
+            && instance::wait_until_running(Duration::from_secs(10))
+        {
+            instance::activate_existing();
+            return;
+        }
+        if has("--elevate") && elevation::run_self_elevated("", false) {
+            return;
+        }
+    }
+
+    let Some(_instance) = instance::claim() else {
+        instance::activate_existing();
+        return;
     };
     sys::priority::raise_process();
+
+    let suspended = Arc::new(Mutex::new(HashSet::new()));
+    resume_suspended_on_panic(Arc::clone(&suspended));
+    let sampler = collector::Sampler::spawn(Arc::clone(&suspended));
+    emergency::init(sampler.clone());
 
     let generated = icon::app_icon();
     let native_options = eframe::NativeOptions {
@@ -36,6 +83,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([520.0, 320.0])
             .with_title(APP_NAME)
+            // Started by the logon task: wait in the tray.
+            .with_visible(!has("--background"))
             .with_icon(egui::IconData {
                 rgba: generated.rgba,
                 width: generated.width,
@@ -44,26 +93,69 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let background = has("--background");
+    let started = eframe::run_native(
         APP_NAME,
         native_options,
-        Box::new(|cc| Ok(Box::new(app::TaskyApp::new(cc)))),
-    )
+        Box::new(move |cc| {
+            Ok(Box::new(app::TaskyApp::new(
+                cc, sampler, suspended, background,
+            )))
+        }),
+    );
+    if started.is_err() {
+        // No usable OpenGL (a broken or missing driver, a bare VM): fall back
+        // to the plain Win32 window rather than not running at all.
+        emergency::run_blocking();
+    }
+}
+
+/// `--install-task` / `--uninstall-task`: do it if elevated, otherwise run
+/// ourselves elevated to do it. Returns the process exit code.
+fn task_command(action: fn() -> Result<(), String>, flag: &str) -> i32 {
+    if !elevation::is_elevated() {
+        return if elevation::run_self_elevated(flag, true) {
+            0
+        } else {
+            1
+        };
+    }
+    match action() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{flag}: {error}");
+            1
+        }
+    }
+}
+
+/// Never leave processes frozen because Tasky crashed. Release builds abort on
+/// panic, so this runs just before the process goes away.
+fn resume_suspended_on_panic(suspended: Arc<Mutex<HashSet<u32>>>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // The panicking thread may be the one holding the lock; never wait.
+        match suspended.try_lock() {
+            Ok(mut pids) => control::resume_all(&mut pids),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                control::resume_all(&mut poisoned.into_inner())
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        default_hook(info);
+    }));
 }
 
 /// Diagnostic mode: print what the sampler can and cannot read.
 ///
 /// Sample twice, because CPU, disk and GPU numbers are rates.
 fn probe() {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
-
     println!("Tasky probe");
     about_system();
     about_gpu();
 
     let suspended = Arc::new(Mutex::new(HashSet::new()));
-    let sampler = collector::Sampler::spawn(suspended, || {});
+    let sampler = collector::Sampler::spawn(suspended);
     std::thread::sleep(Duration::from_millis(1600));
 
     let snapshot = sampler
@@ -96,16 +188,17 @@ fn probe() {
 }
 
 fn about_system() {
-    use sysinfo::System;
-    let mut system = System::new();
-    system.refresh_memory();
-    system.refresh_cpu_all();
+    let (used, total) = sys::machine::memory();
     println!(
         "  memory       : {} used of {} total",
-        fmt::bytes(system.used_memory()),
-        fmt::bytes(system.total_memory())
+        fmt::bytes(used),
+        fmt::bytes(total)
     );
-    println!("  cpus         : {}", system.cpus().len());
+    println!(
+        "  cpus         : {} (first processor group)",
+        sys::machine::PerCore::new().sample().len()
+    );
+    println!("  elevated     : {}", sys::elevation::is_elevated());
 }
 
 fn about_gpu() {

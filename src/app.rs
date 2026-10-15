@@ -10,9 +10,10 @@ use egui::{Align, Color32, Margin, RichText, Sense, ThemePreference, ViewportCom
 use egui_extras::{Column, TableBuilder};
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
+use crate::collector::lock;
 use crate::collector::{self, Row, Sampler, Snapshot};
 use crate::fmt;
-use crate::sys::{control, hotkey, instance, tray};
+use crate::sys::{control, elevation, instance, priority, tray};
 
 /// How long a status-bar message stays visible.
 const NOTICE_TTL: Duration = Duration::from_secs(5);
@@ -66,7 +67,7 @@ impl Col {
             Col::Memory => "Memory",
             Col::MemoryPercent => "Memory %",
             Col::Gpu => "GPU",
-            Col::Disk => "Disk  read / write",
+            Col::Disk => "I/O  read / write",
             Col::Threads => "Threads",
             Col::CommandLine => "Command line",
         }
@@ -259,6 +260,21 @@ enum Page {
     Performance,
 }
 
+/// Whether the elevated logon task is registered. Querying and changing it
+/// spawns `schtasks`, so it happens off the UI thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskStatus {
+    Checking,
+    Installed,
+    Missing,
+}
+
+struct StartupTask {
+    status: TaskStatus,
+    /// A result to show in the status bar, once.
+    message: Option<String>,
+}
+
 pub struct TaskyApp {
     sampler: Sampler,
     /// PIDs we suspended, shared with the sampler so both agree on labelling.
@@ -287,6 +303,10 @@ pub struct TaskyApp {
     hidden: bool,
     /// The bound hotkey's label, if one could be registered.
     hotkey: Option<&'static str>,
+    elevated: bool,
+    startup: Arc<Mutex<StartupTask>>,
+    /// Whether the working set has been pinned yet.
+    pinned: bool,
 
     notice: Option<(String, Instant)>,
     confirm_kill: Option<Vec<u32>>,
@@ -295,7 +315,13 @@ pub struct TaskyApp {
 }
 
 impl TaskyApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `background`: started hidden in the tray (by the logon task).
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        sampler: Sampler,
+        suspended: Arc<Mutex<HashSet<u32>>>,
+        background: bool,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
 
         if let Ok(handle) = cc.window_handle() {
@@ -308,15 +334,20 @@ impl TaskyApp {
         let repaint = ctx.clone();
         instance::on_show(move || repaint.request_repaint());
 
-        let suspended = Arc::new(Mutex::new(HashSet::new()));
         let repaint = ctx.clone();
-        let sampler = Sampler::spawn(Arc::clone(&suspended), move || repaint.request_repaint());
+        sampler.set_on_update(move || repaint.request_repaint());
+        sampler.set_active(!background);
 
         // The tray's "Exit" ends the process from inside its menu handler, so
         // it needs its own way to thaw anything we froze.
         let to_resume = Arc::clone(&suspended);
-        let tray = tray::Tray::new(move || control::resume_all(&mut to_resume.lock().unwrap()));
-        let hotkey = hotkey::bind();
+        let tray = tray::Tray::new(move || control::resume_all(&mut lock(&to_resume)));
+
+        let startup = Arc::new(Mutex::new(StartupTask {
+            status: TaskStatus::Checking,
+            message: None,
+        }));
+        refresh_task_status(&startup, &ctx);
 
         let theme = ThemePreference::System;
         ctx.set_theme(theme);
@@ -345,8 +376,11 @@ impl TaskyApp {
             selected: BTreeSet::new(),
             last_clicked: None,
             tray,
-            hidden: false,
-            hotkey,
+            hidden: background,
+            hotkey: instance::hotkey_label(),
+            elevated: elevation::is_elevated(),
+            startup,
+            pinned: false,
             notice: None,
             confirm_kill: None,
             search_needs_focus: true,
@@ -355,7 +389,7 @@ impl TaskyApp {
             theme,
             clipboard: None,
         };
-        app.sync_thread_collection();
+        app.sync_gpu_collection();
         app
     }
 
@@ -449,9 +483,8 @@ impl TaskyApp {
         column.required() || self.columns[Col::ALL.iter().position(|c| *c == column).unwrap()]
     }
 
-    fn sync_thread_collection(&self) {
-        self.sampler
-            .set_collect_threads(self.column_visible(Col::Threads));
+    fn sync_gpu_collection(&self) {
+        self.sampler.set_collect_gpu(self.column_visible(Col::Gpu));
     }
 
     // ------------------------------------------------------------------ actions
@@ -981,7 +1014,10 @@ impl TaskyApp {
                     ui.separator();
                     meter(ui, "CPU", totals.cpu / 100.0);
                     meter(ui, "Memory", totals.memory_percent() / 100.0);
-                    meter(ui, "GPU", totals.gpu / 100.0);
+                    // Only shown while GPU usage is being collected.
+                    if gpu_available == Some(true) {
+                        meter(ui, "GPU", totals.gpu / 100.0);
+                    }
 
                     ui.separator();
                     ui.label(
@@ -994,7 +1030,7 @@ impl TaskyApp {
                     );
                     ui.label(
                         RichText::new(format!(
-                            "Disk ↓ {}  ↑ {}",
+                            "I/O ↓ {}  ↑ {}",
                             fmt::rate(totals.read_bps),
                             fmt::rate(totals.write_bps)
                         ))
@@ -1004,7 +1040,7 @@ impl TaskyApp {
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if let Some(notice) = notice {
                             ui.label(RichText::new(notice).color(COLOR_WARM));
-                        } else if !gpu_available {
+                        } else if gpu_available == Some(false) {
                             ui.label(RichText::new("GPU counters unavailable").small().weak());
                         } else {
                             ui.label(RichText::new(format!("hotkey {hotkey}")).small().weak());
@@ -1012,6 +1048,55 @@ impl TaskyApp {
                     });
                 });
             });
+    }
+
+    fn permissions_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label("Permissions");
+        if self.elevated {
+            ui.label(RichText::new("Running as administrator.").weak());
+        } else {
+            ui.label(
+                RichText::new(
+                    "Not running as administrator: processes of other users and services \
+                     cannot be ended or suspended.",
+                )
+                .color(COLOR_WARM),
+            );
+            if ui.button("Restart as administrator").clicked() {
+                self.restart_elevated();
+            }
+        }
+
+        let status = lock(&self.startup).status;
+        let mut installed = status == TaskStatus::Installed;
+        let toggle = ui.add_enabled(
+            status != TaskStatus::Checking,
+            egui::Checkbox::new(&mut installed, "Start with Windows, as administrator"),
+        );
+        let toggle = toggle.on_hover_text(
+            "Registers a logon task that starts Tasky elevated in the tray, with no UAC \
+             prompt. Launching Tasky normally then uses that task too.",
+        );
+        if toggle.clicked() {
+            change_task(&self.startup, ui.ctx(), installed, self.elevated);
+        }
+    }
+
+    /// Start an elevated copy that takes over once this one has exited.
+    fn restart_elevated(&mut self) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let spawned = std::process::Command::new(exe)
+            .args(["--wait-for", &std::process::id().to_string(), "--elevate"])
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                control::resume_all(&mut lock(&self.suspended));
+                std::process::exit(0);
+            }
+            Err(error) => self.notify(format!("Could not restart: {error}")),
+        }
     }
 
     fn settings(&mut self, ctx: &egui::Context) {
@@ -1062,6 +1147,9 @@ impl TaskyApp {
                 }
 
                 ui.separator();
+                self.permissions_settings(ui);
+
+                ui.separator();
                 if self.tray.is_some() {
                     ui.label("Closing the window keeps Tasky running in the tray.");
                     if let Some(hotkey) = self.hotkey {
@@ -1073,7 +1161,7 @@ impl TaskyApp {
             });
         self.settings_open = open;
         if columns_changed {
-            self.sync_thread_collection();
+            self.sync_gpu_collection();
         }
     }
 
@@ -1181,6 +1269,17 @@ impl App for TaskyApp {
         self.pull_snapshot();
         self.handle_keys(ctx);
 
+        // Once the window has drawn real data a few times, the pages it needs
+        // are resident; keep them that way.
+        if !self.pinned && self.snapshot.sequence >= 3 {
+            priority::pin_working_set();
+            self.pinned = true;
+        }
+        let message = lock(&self.startup).message.take();
+        if let Some(message) = message {
+            self.notify(message);
+        }
+
         self.toolbar(ctx);
         self.status_bar(ctx);
         match self.page {
@@ -1212,6 +1311,56 @@ impl App for TaskyApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        control::resume_all(&mut self.suspended.lock().unwrap());
+        control::resume_all(&mut lock(&self.suspended));
     }
+}
+
+fn refresh_task_status(startup: &Arc<Mutex<StartupTask>>, ctx: &egui::Context) {
+    let (startup, ctx) = (Arc::clone(startup), ctx.clone());
+    std::thread::spawn(move || {
+        let status = if elevation::task_installed() {
+            TaskStatus::Installed
+        } else {
+            TaskStatus::Missing
+        };
+        lock(&startup).status = status;
+        ctx.request_repaint();
+    });
+}
+
+/// Register or remove the logon task, asking for elevation when needed.
+fn change_task(
+    startup: &Arc<Mutex<StartupTask>>,
+    ctx: &egui::Context,
+    install: bool,
+    elevated: bool,
+) {
+    lock(startup).status = TaskStatus::Checking;
+    let (startup, ctx) = (Arc::clone(startup), ctx.clone());
+    std::thread::spawn(move || {
+        let (action, flag): (fn() -> Result<(), String>, _) = if install {
+            (elevation::install_task, "--install-task")
+        } else {
+            (elevation::uninstall_task, "--uninstall-task")
+        };
+        let ok = if elevated {
+            action().is_ok()
+        } else {
+            elevation::run_self_elevated(flag, true)
+        };
+        let installed = elevation::task_installed();
+        let mut startup = lock(&startup);
+        startup.status = if installed {
+            TaskStatus::Installed
+        } else {
+            TaskStatus::Missing
+        };
+        startup.message = Some(match (ok, install) {
+            (true, true) => "Tasky will start with Windows, as administrator".into(),
+            (true, false) => "Tasky will no longer start with Windows".into(),
+            (false, _) => "Could not change the startup task".into(),
+        });
+        drop(startup);
+        ctx.request_repaint();
+    });
 }
