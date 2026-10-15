@@ -1,0 +1,48 @@
+[package]
+name = "tasky"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A lightweight Windows task manager: live processes, CPU/GPU/RAM/disk usage, kill and suspend."
+build = "build.rs"
+publish = false
+
+[dependencies]
+raw-window-handle = "0.6"
+egui = "0.32.3"
+egui_extras = "0.32.3"
+eframe = "0.32.3"
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
+tray-icon = { version = "0.24.2", default-features = false }
+global-hotkey = "0.6.4"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-manifest = "1.4.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1

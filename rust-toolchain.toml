@@ -1,0 +1,4 @@
+[toolchain]
+# The egui/eframe 0.32 series and their transitive dependency chain need a
+# newer compiler than the machine-wide default, so pin this project to stable.
+channel = "stable"

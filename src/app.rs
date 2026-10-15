@@ -1,0 +1,1274 @@
+//! The egui front end: a dense, sortable process table with kill and suspend.
+
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use eframe::App;
+use egui::{Align, Color32, Margin, RichText, Sense, ViewportCommand, WindowLevel};
+use egui_extras::{Column, TableBuilder};
+
+use crate::collector::{self, Row, Sampler, Snapshot};
+use crate::fmt;
+use crate::sys::{control, hotkey, instance, tray};
+
+/// How long a status-bar message stays visible.
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+/// Below this a value is just noise, and colouring it distracts.
+const NOISE: f64 = 0.05;
+const ROW_HEIGHT: f32 = 18.0;
+const HEADER_HEIGHT: f32 = 24.0;
+
+const COLOR_HOT: Color32 = Color32::from_rgb(0xff, 0x7a, 0x7a);
+const COLOR_WARM: Color32 = Color32::from_rgb(0xff, 0xd1, 0x66);
+const COLOR_COOL: Color32 = Color32::from_rgb(0xa5, 0xd6, 0xa7);
+const COLOR_INFO: Color32 = Color32::from_rgb(0x80, 0xd8, 0xff);
+const COLOR_DANGER: Color32 = Color32::from_rgb(0xff, 0x9a, 0x9a);
+const COLOR_SUSPENDED: Color32 = COLOR_WARM;
+
+/// The sortable, hideable columns of the process table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Col {
+    Name,
+    Pid,
+    Status,
+    Cpu,
+    Memory,
+    MemoryPercent,
+    Gpu,
+    Disk,
+    Threads,
+    CommandLine,
+}
+
+impl Col {
+    const ALL: [Col; 10] = [
+        Col::Name,
+        Col::Pid,
+        Col::Status,
+        Col::Cpu,
+        Col::Memory,
+        Col::MemoryPercent,
+        Col::Gpu,
+        Col::Disk,
+        Col::Threads,
+        Col::CommandLine,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Col::Name => "Name",
+            Col::Pid => "PID",
+            Col::Status => "Status",
+            Col::Cpu => "CPU",
+            Col::Memory => "Memory",
+            Col::MemoryPercent => "Memory %",
+            Col::Gpu => "GPU",
+            Col::Disk => "Disk  read / write",
+            Col::Threads => "Threads",
+            Col::CommandLine => "Command line",
+        }
+    }
+
+    /// Columns whose absence would make the table unusable.
+    fn required(self) -> bool {
+        matches!(self, Col::Name)
+    }
+
+    fn default_width(self) -> f32 {
+        match self {
+            Col::Name => 220.0,
+            Col::Pid => 62.0,
+            Col::Status => 86.0,
+            Col::Cpu => 70.0,
+            Col::Memory => 92.0,
+            Col::MemoryPercent => 90.0,
+            Col::Gpu => 70.0,
+            Col::Disk => 164.0,
+            Col::Threads => 66.0,
+            Col::CommandLine => 260.0,
+        }
+    }
+
+    fn default_visible(self) -> bool {
+        matches!(
+            self,
+            Col::Name
+                | Col::Pid
+                | Col::Status
+                | Col::Cpu
+                | Col::Memory
+                | Col::MemoryPercent
+                | Col::Gpu
+                | Col::Disk
+        )
+    }
+
+    /// Descending feels right for counts and percentages; names sort up.
+    fn wants_descending_on_first_click(self) -> bool {
+        !matches!(self, Col::Name | Col::CommandLine)
+    }
+
+    fn left_aligned(self) -> bool {
+        matches!(self, Col::Name | Col::Status | Col::CommandLine)
+    }
+}
+
+fn percent(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64 * 100.0
+    }
+}
+
+fn fold_case(value: &str) -> String {
+    value.to_lowercase()
+}
+
+fn sorted_rows(rows: &[Row], by: Col, descending: bool, total_memory: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (lhs, rhs) = (&rows[a], &rows[b]);
+        let ordering = compare_rows(lhs, rhs, by, total_memory);
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    order
+}
+
+fn compare_rows(lhs: &Row, rhs: &Row, by: Col, total_memory: u64) -> std::cmp::Ordering {
+    let ordering = match by {
+        Col::Name => fold_case(&lhs.name).cmp(&fold_case(&rhs.name)),
+        Col::Pid => lhs.pid.cmp(&rhs.pid),
+        Col::Status => lhs.suspended.cmp(&rhs.suspended),
+        Col::Cpu => lhs.cpu.total_cmp(&rhs.cpu),
+        Col::Memory => lhs.memory.cmp(&rhs.memory),
+        Col::MemoryPercent => percent(lhs.memory, total_memory)
+            .total_cmp(&percent(rhs.memory, total_memory)),
+        Col::Gpu => lhs.gpu.total_cmp(&rhs.gpu),
+        Col::Disk => (lhs.read_bps + lhs.write_bps).total_cmp(&(rhs.read_bps + rhs.write_bps)),
+        Col::Threads => lhs.threads.cmp(&rhs.threads),
+        Col::CommandLine => fold_case(&lhs.command_line).cmp(&fold_case(&rhs.command_line)),
+    };
+    // Deterministic order when values tie.
+    ordering.then_with(|| lhs.pid.cmp(&rhs.pid))
+}
+
+/// Processes Windows keeps a close eye on; warn before shutting them down.
+fn is_critical_name(name: &str) -> bool {
+    const CRITICAL: [&str; 6] = [
+        "csrss.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "services.exe",
+        "lsass.exe",
+        "smss.exe",
+    ];
+    CRITICAL
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Machine-wide context a cell needs for its text and tooltips.
+#[derive(Clone, Copy)]
+struct TableContext {
+    total_memory: u64,
+}
+
+/// A cell's text plus optional colouring and a longer tooltip.
+struct Cell {
+    text: String,
+    colour: Option<Color32>,
+    tooltip: Option<String>,
+}
+
+fn cell_content(row: &Row, column: Col, ctx: TableContext) -> Cell {
+    let plain = Cell {
+        text: String::new(),
+        colour: None,
+        tooltip: None,
+    };
+    match column {
+        Col::Pid => Cell {
+            text: row.pid.to_string(),
+            ..plain
+        },
+        Col::Cpu => Cell {
+            text: fmt::pct(row.cpu, 1),
+            colour: (row.cpu > NOISE).then(|| heat(row.cpu / 100.0)),
+            ..plain
+        },
+        Col::Memory => Cell {
+            text: fmt::bytes(row.memory),
+            ..plain
+        },
+        Col::MemoryPercent => Cell {
+            text: fmt::pct(percent(row.memory, ctx.total_memory), 2),
+            ..plain
+        },
+        Col::Gpu => Cell {
+            text: fmt::pct(row.gpu, 0),
+            colour: (row.gpu > NOISE).then_some(COLOR_INFO),
+            ..plain
+        },
+        Col::Disk => Cell {
+            text: format!(
+                "{} / {}",
+                fmt::rate(row.read_bps),
+                fmt::rate(row.write_bps)
+            ),
+            colour: ((row.read_bps + row.write_bps) > 128.0 * 1024.0).then_some(COLOR_COOL),
+            tooltip: Some(format!(
+                "Read {}\nWritten {}",
+                fmt::bytes(row.total_read),
+                fmt::bytes(row.total_written)
+            )),
+        },
+        Col::Threads => Cell {
+            text: row.threads.to_string(),
+            ..plain
+        },
+        Col::CommandLine => Cell {
+            text: row.command_line.clone(),
+            ..plain
+        },
+        // Name and Status are rendered by the table itself.
+        Col::Name | Col::Status => plain,
+    }
+}
+
+fn heat(fraction: f64) -> Color32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction > 0.7 {
+        COLOR_HOT
+    } else if fraction > 0.3 {
+        COLOR_WARM
+    } else if fraction > NOISE {
+        COLOR_COOL
+    } else {
+        Color32::GRAY
+    }
+}
+
+/// What the user asked us to do while interacting with a row.
+enum RowAction {
+    Select(usize),
+    Toggle(usize),
+    AddRange(usize, usize),
+    SelectAll,
+    Kill,
+    Suspend,
+    Resume,
+    Reveal,
+    CopyDetail(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    System,
+    Dark,
+    Light,
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Processes,
+    Performance,
+}
+
+
+pub struct TaskyApp {
+    sampler: Sampler,
+    /// PIDs we suspended, shared with the sampler so both agree on labelling.
+    suspended: Arc<Mutex<HashSet<u32>>>,
+
+    snapshot: Arc<Snapshot>,
+    last_sequence: u64,
+    /// Row indices into `snapshot.rows`, after filtering and sorting.
+    visible: Vec<usize>,
+
+    filter: String,
+    search_focused: bool,
+    sort_by: Col,
+    sort_descending: bool,
+    columns: [bool; Col::ALL.len()],
+    refresh_interval: Duration,
+    settings_open: bool,
+
+    selected: BTreeSet<u32>,
+    last_clicked: Option<usize>,
+    page: Page,
+    theme: ThemeMode,
+
+    always_on_top: bool,
+    tray: Option<tray::Tray>,
+    hotkey: Option<hotkey::Hotkey>,
+    hotkey_combo: String,
+    system_ready: bool,
+
+    notice: Option<(String, Instant)>,
+    confirm_kill: Option<Vec<u32>>,
+    search_needs_focus: bool,
+    clipboard: Option<String>,
+}
+
+impl TaskyApp {
+    pub fn new() -> Self {
+        let suspended = Arc::new(Mutex::new(HashSet::new()));
+        let sampler = Sampler::spawn(Arc::clone(&suspended));
+        let snapshot = sampler
+            .latest()
+            .unwrap_or_else(|| Arc::new(Snapshot::default()));
+
+        let mut columns = [false; Col::ALL.len()];
+        for (position, column) in Col::ALL.iter().enumerate() {
+            columns[position] = column.default_visible();
+        }
+
+        let mut app = Self {
+            refresh_interval: collector::SAMPLE_INTERVAL,
+            sampler,
+            suspended,
+            last_sequence: snapshot.sequence,
+            snapshot,
+            visible: Vec::new(),
+            filter: String::new(),
+            search_focused: false,
+            sort_by: Col::Cpu,
+            sort_descending: true,
+            columns,
+            selected: BTreeSet::new(),
+            last_clicked: None,
+            always_on_top: false,
+            tray: None,
+            hotkey: None,
+            hotkey_combo: "unbound".to_string(),
+            system_ready: false,
+            notice: None,
+            confirm_kill: None,
+            search_needs_focus: true,
+            settings_open: false,
+            page: Page::Processes,
+            theme: ThemeMode::System,
+            clipboard: None,
+        };
+        app.rebuild_visible();
+        app
+    }
+
+    // ------------------------------------------------------------------ sampling
+
+    fn pull_snapshot(&mut self) {
+        let Some(next) = self.sampler.latest() else {
+            return;
+        };
+        if next.sequence == self.last_sequence {
+            return;
+        }
+        self.last_sequence = next.sequence;
+        self.snapshot = next;
+        self.rebuild_visible();
+
+        // Processes we had selected can vanish at any time.
+        let live: HashSet<u32> = self.snapshot.rows.iter().map(|row| row.pid).collect();
+        self.selected.retain(|pid| live.contains(pid));
+    }
+
+    fn rebuild_visible(&mut self) {
+        let needle = fold_case(self.filter.trim());
+        let total = self.snapshot.totals.memory_total;
+
+        // Sort everything, then filter: keeps ties stable and the filter cheap.
+        let mut order = sorted_rows(&self.snapshot.rows, self.sort_by, self.sort_descending, total);
+        order.retain(|&index| self.snapshot.rows[index].matches(&needle));
+        self.visible = order;
+    }
+
+    fn row_at(&self, index: usize) -> Option<&Row> {
+        self.visible.get(index).map(|&row| &self.snapshot.rows[row])
+    }
+
+    // ------------------------------------------------------------------ notices
+
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), Instant::now() + NOTICE_TTL));
+    }
+
+    fn current_notice(&mut self) -> Option<&str> {
+        let expired = self
+            .notice
+            .as_ref()
+            .map(|(_, until)| *until < Instant::now())
+            .unwrap_or(true);
+        if expired {
+            self.notice = None;
+            None
+        } else {
+            self.notice.as_ref().map(|(message, _)| message.as_str())
+        }
+    }
+
+    // ------------------------------------------------------------ system glue
+
+    fn install_system_integration(&mut self) {
+        if self.system_ready {
+            return;
+        }
+        self.system_ready = true;
+
+        self.tray = tray::Tray::new();
+        self.hotkey = hotkey::Hotkey::bind();
+        self.hotkey_combo = match &self.hotkey {
+            Some(key) => key.combo.clone(),
+            None => "unavailable".to_string(),
+        };
+    }
+
+    fn debug_log(&self, message: &str) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(
+            r"C:\Users\jury\AppData\Local\Temp\opencode\tasky_debug.log",
+        ) {
+            let _ = writeln!(file, "{:?} {}", std::time::SystemTime::now(), message);
+        }
+    }
+
+    fn handle_events(&mut self, ctx: &egui::Context) {
+        if instance::take_activation_request() { self.debug_log("activation request");
+            self.show_window(ctx);
+        }
+        if hotkey::Hotkey::take_press() { self.debug_log("hotkey pressed");
+            self.show_window(ctx);
+        }
+        let events: Vec<tray::TrayEvent> = if let Some(tray) = &self.tray {
+            self.debug_log("poll tray");
+            tray.poll()
+        } else {
+            Vec::new()
+        };
+        for event in events {
+            match event {
+                tray::TrayEvent::Show => self.show_window(ctx),
+                tray::TrayEvent::ToggleTopmost => {
+                    self.always_on_top = !self.always_on_top;
+                    self.apply_topmost(ctx);
+                    if let Some(tray) = &self.tray {
+                        tray.set_topmost_checked(self.always_on_top);
+                    }
+                }
+                tray::TrayEvent::Exit => {
+                    self.tray = None;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+            }
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) { self.debug_log("show_window");
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        self.apply_topmost(ctx);
+        self.search_needs_focus = true;
+        instance::raise_main_window();
+    }
+
+    fn apply_topmost(&self, ctx: &egui::Context) {
+        let level = if self.always_on_top {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+        crate::sys::instance::apply_always_on_top(self.always_on_top);
+    }
+
+    // ------------------------------------------------------------------ actions
+
+    fn selected_pids(&self) -> Vec<u32> {
+        self.selected.iter().copied().collect()
+    }
+
+    fn selected_rows(&self) -> Vec<Row> {
+        self.snapshot
+            .rows
+            .iter()
+            .filter(|row| self.selected.contains(&row.pid))
+            .cloned()
+            .collect()
+    }
+
+    fn is_suspended(&self, pid: u32) -> bool {
+        self.suspended.lock().unwrap().contains(&pid)
+    }
+
+    fn request_kill(&mut self) {
+        let pids = self.selected_pids();
+        if pids.is_empty() {
+            return;
+        }
+        // Ending a whole selection, or a process Windows guards, deserves a
+        // confirmation; a single ordinary process does not.
+        if pids.len() > 1 || self.selection_is_critical() {
+            self.confirm_kill = Some(pids);
+        } else {
+            self.do_kill(pids);
+        }
+    }
+
+    fn selection_is_critical(&self) -> bool {
+        self.selected_rows()
+            .iter()
+            .any(|row| row.pid <= 8 || row.ppid == 0 || is_critical_name(&row.name))
+    }
+
+    fn do_kill(&mut self, pids: Vec<u32>) {
+        let me = std::process::id();
+        let targets: Vec<u32> = pids
+            .into_iter()
+            .filter(|pid| *pid != me && *pid > 4)
+            .collect();
+
+        let errors = control::kill(&targets);
+        self.selected.clear();
+        self.confirm_kill = None;
+
+        if errors.is_empty() {
+            self.notify(format!(
+                "Requested termination for {} process(es)",
+                targets.len()
+            ));
+        } else {
+            self.notify(format!(
+                "Could not end pid {}: {}",
+                errors[0].pid, errors[0].message
+            ));
+        }
+    }
+
+    /// `None` toggles against the current state; `Some(true)`/`Some(false)`
+    /// forces a direction.
+    fn set_suspended(&mut self, force: Option<bool>) {
+        let pids = self.selected_pids();
+        if pids.is_empty() {
+            return;
+        }
+        let any_suspended = pids.iter().any(|pid| self.is_suspended(*pid));
+        let suspend = force.unwrap_or(!any_suspended);
+
+        let mut lock = self.suspended.lock().unwrap();
+        let mut succeeded = 0;
+        let mut failed = 0;
+        for pid in pids {
+            let outcome = if suspend {
+                control::suspend(pid)
+            } else {
+                control::resume(pid)
+            };
+            match outcome {
+                Ok(()) => {
+                    succeeded += 1;
+                    if suspend {
+                        lock.insert(pid);
+                    } else {
+                        lock.remove(&pid);
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+
+        drop(lock);
+
+        let mut message = format!(
+            "{} {succeeded} process(es)",
+            if suspend { "Suspended" } else { "Resumed" }
+        );
+        if failed > 0 {
+            message.push_str(&format!(", {failed} refused"));
+        }
+        self.notify(message);
+    }
+
+    fn suspend_label(&self) -> &'static str {
+        if self.selected.iter().any(|pid| self.is_suspended(*pid)) {
+            "Resume"
+        } else {
+            "Suspend"
+        }
+    }
+
+    fn reveal_selection(&mut self) {
+        let mut opened = 0;
+        for row in self.selected_rows() {
+            if control::reveal_in_explorer(&row.executable) {
+                opened += 1;
+            }
+        }
+        if opened == 0 {
+            self.notify("Could not open any of the selected executables");
+        }
+    }
+
+    fn copy_detail(&mut self, row: &Row) {
+        self.clipboard = Some(if row.executable.is_empty() {
+            format!("{} (PID {})", row.name, row.pid)
+        } else {
+            format!("{}  {}  PID {}", row.name, row.executable, row.pid)
+        });
+    }
+
+    // ------------------------------------------------------------ row behaviour
+
+    fn apply_row_actions(&mut self, actions: Vec<RowAction>) {
+        for action in actions {
+            match action {
+                RowAction::Select(index) => {
+                    let pid = self.row_at(index).map(|row| row.pid);
+                    self.selected.clear();
+                    if let Some(pid) = pid {
+                        self.selected.insert(pid);
+                    }
+                }
+                RowAction::Toggle(index) => {
+                    if let Some(pid) = self.row_at(index).map(|row| row.pid) {
+                        if !self.selected.remove(&pid) {
+                            self.selected.insert(pid);
+                        }
+                    }
+                }
+                RowAction::AddRange(from, to) => {
+                    let (low, high) = if from <= to { (from, to) } else { (to, from) };
+                    for index in low..=high {
+                        if let Some(pid) = self.row_at(index).map(|row| row.pid) {
+                            self.selected.insert(pid);
+                        }
+                    }
+                }
+                RowAction::SelectAll => {
+                    let pids: Vec<u32> = self
+                        .visible
+                        .iter()
+                        .map(|&index| self.snapshot.rows[index].pid)
+                        .collect();
+                    self.selected.clear();
+                    self.selected.extend(pids);
+                }
+                RowAction::Kill => self.request_kill(),
+                RowAction::Suspend => self.set_suspended(Some(true)),
+                RowAction::Resume => self.set_suspended(Some(false)),
+                RowAction::Reveal => self.reveal_selection(),
+                RowAction::CopyDetail(index) => {
+                    if let Some(row) = self.row_at(index) {
+                        let row = row.clone();
+                        self.copy_detail(&row);
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------- panels
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let visuals = match self.theme {
+            ThemeMode::System => ctx
+                .system_theme()
+                .map(|theme| match theme {
+                    egui::Theme::Dark => egui::Visuals::dark(),
+                    egui::Theme::Light => egui::Visuals::light(),
+                })
+                .unwrap_or_else(|| {
+                    if ctx.style().visuals.dark_mode {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    }
+                }),
+            ThemeMode::Dark => egui::Visuals::dark(),
+            ThemeMode::Light => egui::Visuals::light(),
+        };
+        ctx.style_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+            style.spacing.button_padding = egui::vec2(6.0, 3.0);
+            style.visuals = visuals;
+        });
+    }
+
+
+    fn toolbar(&mut self, ctx: &egui::Context) {
+        let mut topmost_clicked = false;
+        egui::TopBottomPanel::top("toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.faint_bg_color)
+                    .inner_margin(Margin::symmetric(10, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Tasky").strong().size(17.0));
+                    ui.separator();
+
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("Search name, path or PID")
+                            .desired_width(210.0)
+                            .id_source("tasky-search"),
+                    );
+                    self.search_focused = search.has_focus();
+                    if self.search_needs_focus {
+                        search.request_focus();
+                        self.search_needs_focus = false;
+                    }
+
+                    ui.separator();
+
+                    let count = self.selected.len();
+                    ui.add_enabled_ui(count > 0, |ui| {
+                        ui.label(
+                            RichText::new(format!("{count} selected"))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+
+                        if ui
+                            .button(RichText::new("End task").color(COLOR_DANGER))
+                            .on_hover_text("Terminate the selection  [Delete]")
+                            .clicked()
+                        {
+                            self.request_kill();
+                        }
+                        if ui
+                            .button(self.suspend_label())
+                            .on_hover_text("Freeze or unfreeze the selection")
+                            .clicked()
+                        {
+                            self.set_suspended(None);
+                        }
+                        if ui
+                            .button("Open file location")
+                            .on_hover_text("Reveal the executable in Explorer")
+                            .clicked()
+                        {
+                            self.reveal_selection();
+                        }
+                    });
+
+                    ui.separator();
+
+                    if ui
+                        .toggle_value(&mut self.always_on_top, "Always on top")
+                        .clicked()
+                    {
+                        topmost_clicked = true;
+                    }
+
+                    if ui
+                        .selectable_label(self.page == Page::Processes, "Processes")
+                        .clicked()
+                    {
+                        self.page = Page::Processes;
+                    }
+
+                    if ui
+                        .selectable_label(self.page == Page::Performance, "Performance")
+                        .clicked()
+                    {
+                        self.page = Page::Performance;
+                    }
+
+                    if ui
+                        .button("Settings")
+                        .on_hover_text("Refresh rate and visible columns")
+                        .clicked()
+                    {
+                        self.settings_open = !self.settings_open;
+                    }
+                });
+            });
+
+        if topmost_clicked {
+            self.apply_topmost(ctx);
+            if let Some(tray) = &self.tray {
+                tray.set_topmost_checked(self.always_on_top);
+            }
+        }
+    }
+
+    fn process_table(&mut self, ctx: &egui::Context) {
+        let snapshot = Arc::clone(&self.snapshot);
+        let visible = self.visible.clone();
+        let columns = self.columns;
+        let sort_by = self.sort_by;
+        let table_ctx = TableContext {
+            total_memory: snapshot.totals.memory_total,
+        };
+        let selected = self.selected.clone();
+
+        let mut header_change: Option<Col> = None;
+        let mut header_descending = self.sort_descending;
+        let mut actions: Vec<RowAction> = Vec::new();
+        let mut last_clicked = self.last_clicked;
+
+        if self.page == Page::Performance {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label(RichText::new("Per-core CPU usage").strong().size(16.0));
+                ui.separator();
+                let cores = self.snapshot.totals.per_core_cpu.clone();
+                for (index, core) in cores.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Core {:>2}", index));
+                        ui.add(egui::ProgressBar::new((core / 100.0).clamp(0.0, 1.0) as f32)
+                            .desired_width(260.0)
+                            .desired_height(12.0)
+                            .show_percentage());
+                        ui.label(format!("{}%", (*core).clamp(0.0, 100.0)));
+                    });
+                }
+                ui.separator();
+                ui.label(format!("Total CPU: {:.1}%  ({} cores)", self.snapshot.totals.cpu, cores.len()));
+                ui.label(format!("RAM: {} / {}", fmt::bytes(self.snapshot.totals.memory_used), fmt::bytes(self.snapshot.totals.memory_total)));
+            });
+            return;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let builder = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .vscroll(true)
+                .sense(Sense::click())
+                .cell_layout(egui::Layout::left_to_right(Align::Center));
+            let mut builder = builder;
+            for column in Col::ALL {
+                if !columns[Col::ALL.iter().position(|c| *c == column).unwrap()] && !column.required() {
+                    continue;
+                }
+                builder = builder.column(
+                    Column::initial(column.default_width())
+                        .at_least(34.0)
+                        .resizable(true),
+                );
+            }
+            let table = builder.header(HEADER_HEIGHT, |mut header| {
+                    for (position, column) in Col::ALL.iter().enumerate() {
+                        if !columns[position] && !column.required() {
+                            continue;
+                        }
+                        header.col(|ui| {
+                            let active = sort_by == *column;
+                            let marker = match (active, header_descending) {
+                                (true, true) => " v",
+                                (true, false) => " ^",
+                                (false, _) => "",
+                            };
+                            let colour = if active {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            let label =
+                                RichText::new(format!("{}{marker}", column.label())).color(colour);
+                            if ui
+                                .add(egui::Label::new(label).sense(Sense::click()))
+                                .clicked()
+                            {
+                                if active {
+                                    header_descending = !header_descending;
+                                } else {
+                                    header_change = Some(*column);
+                                    header_descending = column.wants_descending_on_first_click();
+                                }
+                            }
+                        });
+                    }
+                });
+
+            table.body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let data = &snapshot.rows[visible[row.index()]];
+                    let pid = data.pid;
+                    row.set_selected(selected.contains(&pid));
+
+                    for (position, column) in Col::ALL.iter().enumerate() {
+                        if !columns[position] && !column.required() {
+                            continue;
+                        }
+                        let data = data;
+                        row.col(|ui| match column {
+                            Col::Name => {
+                                let colour = if data.suspended {
+                                    COLOR_SUSPENDED
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let response = ui.add(
+                                    egui::Label::new(RichText::new(&data.name).color(colour))
+                                        .truncate(),
+                                );
+                                if !data.executable.is_empty() {
+                                    response.on_hover_text(format!(
+                                        "{}\nPID {pid}  ·  parent PID {}",
+                                        data.executable, data.ppid
+                                    ));
+                                }
+                            }
+                            Col::Status => {
+                                let label = if data.suspended {
+                                    RichText::new("Suspended")
+                                        .color(COLOR_SUSPENDED)
+                                        .strong()
+                                } else {
+                                    RichText::new("Running").weak()
+                                };
+                                ui.label(label);
+                            }
+                            other => {
+                                let cell = cell_content(data, *other, table_ctx);
+                                let align = if other.left_aligned() {
+                                    egui::Layout::left_to_right(Align::Center)
+                                } else {
+                                    egui::Layout::right_to_left(Align::Center)
+                                };
+                                ui.with_layout(align, |ui| {
+                                    let text = match cell.colour {
+                                        Some(colour) => RichText::new(cell.text).color(colour),
+                                        None => RichText::new(cell.text),
+                                    };
+                                    let response = ui.add(egui::Label::new(text).truncate());
+                                    if let Some(tooltip) = cell.tooltip {
+                                        response.on_hover_text(tooltip);
+                                    }
+                                });
+                            }
+                        });
+                    }
+
+                    let response = row.response();
+                    let index = row.index();
+                    if response.clicked() {
+                        let index = row.index();
+                            let modifiers = ctx.input(|i| i.modifiers);
+                        if modifiers.ctrl {
+                            actions.push(RowAction::Toggle(index));
+                        } else if modifiers.shift {
+                            match last_clicked {
+                                Some(anchor) => actions.push(RowAction::AddRange(anchor, index)),
+                                None => actions.push(RowAction::Select(index)),
+                            }
+                        } else {
+                            actions.push(RowAction::Select(index));
+                        }
+                        last_clicked = Some(index);
+                    }
+                    if response.double_clicked() {
+                        actions.push(RowAction::Reveal);
+                    }
+
+                    response.context_menu(|ui| {
+                        if ui.button("End task").clicked() {
+                            actions.push(RowAction::Kill);
+                            ui.close();
+                        }
+                        if ui.button("Suspend").clicked() {
+                            actions.push(RowAction::Suspend);
+                            ui.close();
+                        }
+                        if ui.button("Resume").clicked() {
+                            actions.push(RowAction::Resume);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Open file location").clicked() {
+                            actions.push(RowAction::Reveal);
+                            ui.close();
+                        }
+                        if ui.button("Copy process details").clicked() {
+                            actions.push(RowAction::CopyDetail(index));
+                            ui.close();
+                        }
+                        if ui.button("Select all").clicked() {
+                            actions.push(RowAction::SelectAll);
+                            ui.close();
+                        }
+                    });
+                });
+            });
+        });
+
+        self.last_clicked = last_clicked;
+        self.apply_row_actions(actions);
+
+        if let Some(column) = header_change {
+            self.sort_by = column;
+            self.sort_descending = header_descending;
+            self.rebuild_visible();
+        } else if header_descending != self.sort_descending {
+            self.sort_descending = header_descending;
+            self.rebuild_visible();
+        }
+    }
+
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        let totals = self.snapshot.totals.clone();
+        let gpu_available = self.snapshot.gpu_available;
+        let notice = self.current_notice().map(|text| text.to_string());
+        let combo = self.hotkey_combo.clone();
+
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.faint_bg_color)
+                    .inner_margin(Margin::symmetric(10, 4)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} processes", totals.processes)).weak());
+
+                    ui.separator();
+                    meter(ui, "CPU", totals.cpu / 100.0);
+                    meter(ui, "Memory", totals.memory_percent() / 100.0);
+                    meter(ui, "GPU", totals.gpu / 100.0);
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!(
+                            "RAM {} / {}",
+                            fmt::bytes(totals.memory_used),
+                            fmt::bytes(totals.memory_total)
+                        ))
+                        .weak(),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Disk ↓ {}  ↑ {}",
+                            fmt::rate(totals.read_bps),
+                            fmt::rate(totals.write_bps)
+                        ))
+                        .weak(),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(notice) = notice {
+                            ui.label(RichText::new(notice).color(COLOR_WARM));
+                        } else if !gpu_available {
+                            ui.label(RichText::new("GPU counters unavailable").small().weak());
+                        } else {
+                            ui.label(
+                                RichText::new(format!("{} cores · hotkey {combo}", totals.cpu_cores))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(280.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Refresh rate");
+                for (label, value) in [
+                    ("0.5 s", Duration::from_millis(500)),
+                    ("1 s", collector::SAMPLE_INTERVAL),
+                    ("2 s", Duration::from_millis(2000)),
+                    ("5 s", Duration::from_millis(5000)),
+                ] {
+                    if ui
+                        .selectable_label(self.refresh_interval == value, label)
+                        .clicked()
+                    {
+                        self.refresh_interval = value;
+                        self.sampler.set_interval(value);
+                    }
+                }
+
+                ui.separator();
+                ui.label("Theme");
+                for (label, value) in [
+                    ("System", ThemeMode::System),
+                    ("Dark", ThemeMode::Dark),
+                    ("Light", ThemeMode::Light),
+                ] {
+                    if ui.selectable_label(self.theme == value, label).clicked() {
+                        self.theme = value;
+                    }
+                }
+                ui.separator();
+
+                ui.separator();
+                ui.label("Columns");
+                for (position, column) in Col::ALL.iter().enumerate() {
+                    let mut visible = self.columns[position];
+                    if !column.required()
+                        && ui
+                            .checkbox(&mut visible, column.label())
+                            .clicked()
+                    {
+                        self.columns[position] = visible;
+                    }
+                }
+
+                ui.separator();
+                if self.tray.is_some() {
+                    ui.label("Closing the window keeps Tasky running in the tray.");
+                    ui.label(format!("Press the hotkey ({}) to summon it back.", self.hotkey_combo));
+                } else {
+                    ui.label("Closing the window quits Tasky.");
+                }
+            });
+        self.settings_open = open;
+    }
+
+    fn confirm_kill_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pids) = self.confirm_kill.clone() else {
+            return;
+        };
+        let rows = self.selected_rows();
+        let mut keep_open = true;
+
+        egui::Window::new("End task")
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Terminate {} process(es)? Unsaved data will be lost.",
+                    pids.len()
+                ));
+                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                    for row in rows.iter().take(12) {
+                        ui.label(format!("{}  (PID {})", row.name, row.pid));
+                    }
+                    if rows.len() > 12 {
+                        ui.label(RichText::new(format!("…and {} more", rows.len() - 12)).weak());
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_kill = None;
+                    }
+                    if ui
+                        .button(RichText::new("End task").color(COLOR_DANGER))
+                        .clicked()
+                    {
+                        let pids = pids.clone();
+                        self.do_kill(pids);
+                    }
+                });
+            });
+
+        if !keep_open {
+            self.confirm_kill = None;
+        }
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Let the search box keep its normal Delete and Escape behaviour.
+        if self.search_focused {
+            return;
+        }
+
+        let delete = ctx.input(|input| input.key_pressed(egui::Key::Delete));
+        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let ctrl = ctx.input(|input| input.modifiers.ctrl);
+        let select_all = ctrl && ctx.input(|input| input.key_pressed(egui::Key::A));
+
+        if delete && !self.selected.is_empty() {
+            self.request_kill();
+        } else if select_all {
+            self.apply_row_actions(vec![RowAction::SelectAll]);
+        } else if escape {
+            if self.selected.is_empty() && !self.filter.is_empty() {
+                self.filter.clear();
+                self.rebuild_visible();
+            } else {
+                self.selected.clear();
+            }
+        }
+    }
+}
+
+/// A small labelled gauge for the status bar.
+fn meter(ui: &mut egui::Ui, label: &str, fraction: f64) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).weak());
+        ui.add(
+            egui::ProgressBar::new(fraction.clamp(0.0, 1.0) as f32)
+                .desired_width(60.0)
+                .desired_height(9.0)
+            );
+        ui.label(RichText::new(format!("{:.0}%", fraction * 100.0)).weak().small());
+    });
+}
+
+impl App for TaskyApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        use raw_window_handle::HasWindowHandle as _;
+        use raw_window_handle::RawWindowHandle;
+        // The tray icon and the hotkey both need a message loop, which only
+        // exists once eframe is running, so they get built here.
+        self.install_system_integration();
+        if let Ok(window_handle) = frame.window_handle() {
+            if let RawWindowHandle::Win32(win) = window_handle.as_raw() {
+                let hwnd = windows::Win32::Foundation::HWND(win.hwnd.get() as *mut _);
+                crate::sys::instance::store_main_window(hwnd);
+            }
+        }
+        crate::sys::instance::remember_main_window();
+        if crate::sys::instance::take_restore_request() {
+            self.show_window(ctx);
+        }
+        self.always_on_top = crate::sys::instance::is_always_on_top();
+
+        self.handle_events(ctx);
+        self.debug_log("update");
+        self.apply_theme(ctx);
+        self.pull_snapshot();
+        self.handle_keys(ctx);
+
+        self.toolbar(ctx);
+        self.status_bar(ctx);
+        self.process_table(ctx);
+
+        if self.settings_open {
+            self.settings(ctx);
+        }
+        self.confirm_kill_dialog(ctx);
+
+        if let Some(text) = self.clipboard.take() {
+            ctx.copy_text(text);
+        }
+
+        // Closing the window hides it into the tray rather than quitting,
+        // which is what "always available" means in practice.
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+impl Default for TaskyApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
