@@ -4,27 +4,39 @@
 //! host thread owns a hidden window of a known class and the global hotkey,
 //! and runs its own message loop. A second launch finds that window and posts
 //! it a message. Because none of this runs on the UI thread, Tasky can still be
-//! summoned when the UI is idle behind a hidden window, and when the UI thread
-//! has stopped responding (then the emergency window opens instead).
+//! summoned when the UI is idle in the tray, and when the UI thread has
+//! stopped responding (then the emergency window opens instead).
+//!
+//! "In the tray" never means hidden (`SW_HIDE`). eframe schedules repaints
+//! through winit's `request_redraw`, i.e. `RedrawWindow(RDW_INTERNALPAINT)`,
+//! and switches its event loop to polling until the `WM_PAINT` arrives. A
+//! hidden window never gets that `WM_PAINT`, so a single repaint request after
+//! hiding left the UI thread spinning on a whole core. Instead the window is
+//! *stowed*: cloaked by DWM (invisible, not clickable), with the tool-window
+//! style (no taskbar button, not in Alt+Tab), but still visible as far as
+//! Windows is concerned, so repaints complete and the loop goes back to sleep.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
+use windows::core::BOOL;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_ACCESSDENIED, HANDLE, HINSTANCE, HWND,
     LPARAM, LRESULT, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, FindWindowW, GetMessageW, IsIconic, PostMessageW, RegisterClassW,
-    SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, ASFW_ANY,
-    HWND_NOTOPMOST, HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_HOTKEY, WM_NULL,
-    WNDCLASSW, WS_OVERLAPPED,
+    DispatchMessageW, FindWindowW, GetMessageW, GetWindowLongW, IsIconic, PostMessageW,
+    RegisterClassW, SendMessageTimeoutW, SetForegroundWindow, SetWindowLongW, SetWindowPos,
+    ShowWindow, TranslateMessage, ASFW_ANY, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, MSG,
+    MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_APP, WM_HOTKEY, WM_NULL, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::sys::hotkey;
@@ -38,6 +50,7 @@ const RESPONSE_TIMEOUT_MS: u32 = 1000;
 static MAIN_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(false);
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+static STOWED: AtomicBool = AtomicBool::new(false);
 static ON_SHOW: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 static HOTKEY: OnceLock<Option<&'static str>> = OnceLock::new();
 
@@ -224,6 +237,13 @@ pub fn show_main_window() {
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(hwnd) = main_window() {
         unsafe {
+            if STOWED.swap(false, Ordering::SeqCst) {
+                // Hide around the style change so the shell re-adds the
+                // taskbar button when the window shows again.
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                set_tool_window(hwnd, false);
+                set_cloaked(hwnd, false);
+            }
             let command = if IsIconic(hwnd).as_bool() {
                 SW_RESTORE
             } else {
@@ -236,6 +256,51 @@ pub fn show_main_window() {
     if let Some(callback) = ON_SHOW.get() {
         callback();
     }
+}
+
+/// Put the main window in the tray: invisible, no taskbar button, not in
+/// Alt+Tab, not focused, yet still visible to Windows (see the module docs).
+/// Call on the UI thread.
+pub fn stow_main_window() {
+    let Some(hwnd) = main_window() else {
+        return;
+    };
+    STOWED.store(true, Ordering::SeqCst);
+    unsafe {
+        // Hiding hands activation to another window and drops the taskbar
+        // button; the window comes straight back, cloaked and inactive.
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        set_tool_window(hwnd, true);
+        if set_cloaked(hwnd, true) {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        // Without DWM there is no cloaking; staying hidden is the lesser evil.
+    }
+}
+
+unsafe fn set_tool_window(hwnd: HWND, on: bool) {
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let style = if on {
+            (style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0
+        } else {
+            style & !WS_EX_TOOLWINDOW.0
+        };
+        SetWindowLongW(hwnd, GWL_EXSTYLE, style as i32);
+    }
+}
+
+unsafe fn set_cloaked(hwnd: HWND, on: bool) -> bool {
+    let value = BOOL::from(on);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &value as *const BOOL as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    }
+    .is_ok()
 }
 
 /// True if the window was raised from outside eframe since the last poll.

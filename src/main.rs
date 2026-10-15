@@ -83,8 +83,6 @@ fn main() {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([520.0, 320.0])
             .with_title(APP_NAME)
-            // Started by the logon task: wait in the tray.
-            .with_visible(!has("--background"))
             .with_icon(egui::IconData {
                 rgba: generated.rgba,
                 width: generated.width,

@@ -307,6 +307,8 @@ pub struct TaskyApp {
     startup: Arc<Mutex<StartupTask>>,
     /// Whether the working set has been pinned yet.
     pinned: bool,
+    /// Started in the tray: stow the window again once eframe has shown it.
+    restow: bool,
 
     notice: Option<(String, Instant)>,
     confirm_kill: Option<Vec<u32>>,
@@ -337,6 +339,12 @@ impl TaskyApp {
         let repaint = ctx.clone();
         sampler.set_on_update(move || repaint.request_repaint());
         sampler.set_active(!background);
+        if background {
+            // eframe shows its window after the first frame whatever the
+            // viewport builder says, so stow it now (no flash, no taskbar
+            // button) and again after that first frame (see `update`).
+            instance::stow_main_window();
+        }
 
         // The tray's "Exit" ends the process from inside its menu handler, so
         // it needs its own way to thaw anything we froze.
@@ -381,6 +389,7 @@ impl TaskyApp {
             elevated: elevation::is_elevated(),
             startup,
             pinned: false,
+            restow: background,
             notice: None,
             confirm_kill: None,
             search_needs_focus: true,
@@ -459,16 +468,17 @@ impl TaskyApp {
     /// Bring eframe's view of the window in line after something outside it
     /// (hotkey, tray, second launch) has already shown it natively.
     fn on_shown(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.search_needs_focus = true;
         self.hidden = false;
     }
 
+    /// Never `ViewportCommand::Visible(false)`: a hidden window leaves eframe
+    /// polling for a repaint that never comes (see `sys::instance`).
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        instance::stow_main_window();
         self.hidden = true;
     }
 
@@ -1259,7 +1269,18 @@ fn meter(ui: &mut egui::Ui, label: &str, fraction: f64) {
 impl App for TaskyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if instance::take_show_request() {
+            self.restow = false;
             self.on_shown(ctx);
+        }
+        if self.restow {
+            // eframe shows (and activates) the window after the first frame;
+            // put it back, inactive, from the second one on.
+            if ctx.cumulative_pass_nr() == 0 {
+                ctx.request_repaint();
+            } else {
+                self.restow = false;
+                instance::stow_main_window();
+            }
         }
         // Nobody can see a hidden or minimized window; stop sampling until
         // it is back.
