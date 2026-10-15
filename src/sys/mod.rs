@@ -8,5 +8,6 @@ pub mod gpu;
 pub mod hotkey;
 pub mod icon;
 pub mod instance;
+pub mod priority;
 pub mod procs;
 pub mod tray;

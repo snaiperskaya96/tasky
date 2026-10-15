@@ -6,8 +6,9 @@
 
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        let manifest = embed_manifest::new_manifest("Tasky")
-            .requested_execution_level(embed_manifest::manifest::ExecutionLevel::RequireAdministrator);
+        let manifest = embed_manifest::new_manifest("Tasky").requested_execution_level(
+            embed_manifest::manifest::ExecutionLevel::RequireAdministrator,
+        );
 
         embed_manifest::embed_manifest(manifest).expect("failed to embed the application manifest");
         println!("cargo:rerun-if-changed=build.rs");

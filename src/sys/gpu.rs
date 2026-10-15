@@ -20,7 +20,6 @@ const GPU_ENGINE_PATH: &str = r"\GPU Engine(*)\Utilization Percentage";
 pub struct GpuSampler {
     query: PDH_HQUERY,
     counter: PDH_HCOUNTER,
-    path: Vec<u16>,
     buf: Vec<u64>,
     available: bool,
 }
@@ -30,20 +29,20 @@ impl GpuSampler {
         let mut sampler = Self {
             query: PDH_HQUERY::default(),
             counter: PDH_HCOUNTER::default(),
-            path: wide(GPU_ENGINE_PATH),
             // Over-aligned scratch buffer: PDH writes a struct with a pointer
             // field into it, so it must be at least 8-byte aligned.
             buf: Vec::new(),
             available: false,
         };
 
+        let path = wide(GPU_ENGINE_PATH);
         if unsafe { PdhOpenQueryW(None, 0, &mut sampler.query) } != 0 {
             return sampler;
         }
         if unsafe {
             PdhAddEnglishCounterW(
                 sampler.query,
-                windows::core::PCWSTR(sampler.path.as_ptr()),
+                windows::core::PCWSTR(path.as_ptr()),
                 0,
                 &mut sampler.counter,
             )
@@ -81,13 +80,7 @@ impl GpuSampler {
         let mut size = 0u32;
         let mut count = 0u32;
         if unsafe {
-            PdhGetFormattedCounterArrayW(
-                self.counter,
-                PDH_FMT_DOUBLE,
-                &mut size,
-                &mut count,
-                None,
-            )
+            PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, None)
         } != 0
             || size == 0
         {
@@ -118,8 +111,8 @@ impl GpuSampler {
         for i in 0..item_count as isize {
             // SAFETY: `item_count` entries were just written by PDH into `buf`.
             let item = unsafe { &*items.offset(i) };
-            let name = read_pwstr(item.szName.0);
-            if let Some(pid) = pid_from_instance_name(&name) {
+            // SAFETY: PDH fills `szName` with a NUL-terminated instance name.
+            if let Some(pid) = unsafe { pid_from_instance_name(item.szName.0) } {
                 // SAFETY: we requested PDH_FMT_DOUBLE, which fills this union arm.
                 let value = unsafe { item.FmtValue.Anonymous.doubleValue };
                 if value > 0.0 {
@@ -147,30 +140,29 @@ impl Drop for GpuSampler {
     }
 }
 
-/// Pull the PID out of an instance name such as `pid_1234_luid_0x123_phys_0_eng_1_engtype_3D`.
-fn pid_from_instance_name(name: &str) -> Option<u32> {
-    let mut parts = name.split('_');
-    if parts.next()? != "pid" {
+/// Pull the PID out of an instance name such as
+/// `pid_1234_luid_0x123_phys_0_eng_1_engtype_3D`, reading the UTF-16 string in
+/// place rather than allocating a `String` for each of the many instances.
+unsafe fn pid_from_instance_name(mut ptr: *const u16) -> Option<u32> {
+    if ptr.is_null() {
         return None;
     }
-    parts.next()?.parse().ok()
+    for expected in "pid_".encode_utf16() {
+        if unsafe { *ptr } != expected {
+            return None;
+        }
+        ptr = unsafe { ptr.add(1) };
+    }
+    let mut pid: u32 = 0;
+    let mut digits = 0;
+    while let Some(digit) = char::from_u32(unsafe { *ptr } as u32).and_then(|c| c.to_digit(10)) {
+        pid = pid.checked_mul(10)?.checked_add(digit)?;
+        digits += 1;
+        ptr = unsafe { ptr.add(1) };
+    }
+    (digits > 0).then_some(pid)
 }
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn read_pwstr(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0usize;
-    while unsafe { *ptr.add(len) } != 0 {
-        len += 1;
-        if len > 512 {
-            break;
-        }
-    }
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    String::from_utf16_lossy(slice)
 }

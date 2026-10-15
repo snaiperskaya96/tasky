@@ -18,29 +18,17 @@ use sys::icon;
 const APP_NAME: &str = "Tasky";
 
 fn main() -> eframe::Result<()> {
-    // A second launch activates the running instance and exits.
-    let Some(_host) = sys::instance::claim() else {
-        println!("Tasky is already running — activating that window instead.");
-        sys::instance::activate_existing();
-        return Ok(());
-    };
-
     if std::env::args().any(|argument| argument == "--probe") {
         probe();
         return Ok(());
     }
-    if std::env::args().any(|argument| argument == "--probe-hook") {
-        let _ = sys::hotkey::Hotkey::bind();
-        println!("probe-hook ready; press Ctrl+Alt+T");
-        loop {
-            if sys::hotkey::Hotkey::take_press() {
-                println!("HOTKEY PRESSED");
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+
+    // A second launch activates the running instance and exits.
+    let Some(_instance) = sys::instance::claim() else {
+        sys::instance::activate_existing();
         return Ok(());
-    }
+    };
+    sys::priority::raise_process();
 
     let generated = icon::app_icon();
     let native_options = eframe::NativeOptions {
@@ -59,7 +47,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_NAME,
         native_options,
-        Box::new(|_cc| Ok(Box::new(app::TaskyApp::new()))),
+        Box::new(|cc| Ok(Box::new(app::TaskyApp::new(cc)))),
     )
 }
 
@@ -75,7 +63,7 @@ fn probe() {
     about_gpu();
 
     let suspended = Arc::new(Mutex::new(HashSet::new()));
-    let sampler = collector::Sampler::spawn(suspended);
+    let sampler = collector::Sampler::spawn(suspended, || {});
     std::thread::sleep(Duration::from_millis(1600));
 
     let snapshot = sampler
@@ -88,11 +76,11 @@ fn probe() {
         println!(
             "    pid {:>6}  {:<24} cpu {:>5.1}%  gpu {:>4.0}%  mem {:>9}  {}",
             row.pid,
-            row.name,
+            row.info.name,
             row.cpu,
             row.gpu,
             fmt::bytes(row.memory),
-            row.executable
+            row.info.executable
         );
     }
     let totals = &snapshot.totals;
@@ -117,12 +105,7 @@ fn about_system() {
         fmt::bytes(system.used_memory()),
         fmt::bytes(system.total_memory())
     );
-    println!(
-        "  cores        : {}",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    );
+    println!("  cpus         : {}", system.cpus().len());
 }
 
 fn about_gpu() {
