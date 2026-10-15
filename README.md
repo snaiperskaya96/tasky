@@ -38,6 +38,13 @@ system tray icon.
   summed per PID (same method Task Manager uses), read only while the GPU
   column is visible.
 
+## Download
+
+Every push builds `tasky.exe` on GitHub Actions: open the latest run of the
+**Build** workflow under the repository's Actions tab and download the
+`tasky-…` artifact. Tagged versions (`v*`) are also published as releases with
+the exe attached.
+
 ## Requirements
 
 - Windows 10 / 11 (x86_64).

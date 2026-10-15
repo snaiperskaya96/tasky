@@ -1,0 +1,58 @@
+name: Build
+
+# Builds the release tasky.exe on every push and pull request, and offers it as
+# a downloadable artifact on the run's page. Pushing a tag such as v0.2.0 also
+# publishes a GitHub release with the exe attached.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; rustup installs it on first use.
+      - name: Show toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Upload tasky.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: tasky-${{ github.sha }}
+          path: target/release/tasky.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tasky-${{ github.sha }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tasky.exe
+          generate_release_notes: true
